@@ -1,0 +1,184 @@
+#!/bin/bash
+#-------------------------------------------------
+# Recon + Enumeration + Passive OSINT Framework
+#-------------------------------------------------
+
+set -Eeuo pipefail
+
+# ========== Colors ==========
+Red=$'\e[1;31m'
+Green=$'\e[1;32m'
+Blue=$'\e[1;34m'
+Purple=$'\e[1;35m'
+White=$'\e[0m'
+
+# ========== Input ==========
+read -p "Project Name: " PROJECT
+read -p "Target (IP or Domain): " TARGET
+
+[[ -z "$PROJECT" || -z "$TARGET" ]] && {
+    echo -e "${Red}[!] Missing input${White}"
+    exit 1
+}
+
+NET=""   # NO CIDR PROMPT (intentional)
+
+# ========== Detect Domain vs IP ==========
+if [[ "$TARGET" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    IS_DOMAIN=false
+    IP="$TARGET"
+else
+    IS_DOMAIN=true
+    DOMAIN="$TARGET"
+    IP=$(dig +short "$DOMAIN" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n1)
+fi
+
+[[ -z "${IP:-}" ]] && {
+    echo -e "${Red}[!] Failed to resolve IP for $TARGET${White}"
+    exit 1
+}
+
+echo -e "${Green}[*] Using IP: $IP${White}"
+
+# ========== Setup ==========
+mkdir -p "$PROJECT"/{nmap,web,network,osint,report}
+cd "$PROJECT"
+
+# Live output + logging (NO buffering issue)
+exec > >(stdbuf -oL tee recon.log) 2>&1
+
+REPORT="report/Pentest_Report.md"
+START_TIME=$(date)
+
+# ========== Tool Detection ==========
+echo -e "${Blue}[*] Checking tools...${White}"
+for tool in nmap gobuster nikto whatweb curl dig openssl whois; do
+    command -v "$tool" &>/dev/null || {
+        echo -e "${Red}[!] Missing tool: $tool${White}"
+        exit 1
+    }
+done
+
+command -v amass &>/dev/null && HAS_AMASS=true || HAS_AMASS=false
+command -v subfinder &>/dev/null && HAS_SUBFINDER=true || HAS_SUBFINDER=false
+command -v theHarvester &>/dev/null && HAS_HARVESTER=true || HAS_HARVESTER=false
+command -v enum4linux &>/dev/null && HAS_ENUM4LINUX=true || HAS_ENUM4LINUX=false
+command -v snmpwalk &>/dev/null && HAS_SNMP=true || HAS_SNMP=false
+
+# ========== Report Header ==========
+cat << EOF > "$REPORT"
+# Penetration Test Reconnaissance Report
+
+## Target
+- Target: $TARGET
+- Resolved IP: $IP
+- Assessment Date: $START_TIME
+
+---
+
+## Findings
+EOF
+
+# ========== Passive OSINT ==========
+if [[ "$IS_DOMAIN" == true ]]; then
+    echo -e "${Blue}[*] Passive OSINT...${White}"
+
+    whois "$DOMAIN" > osint/whois.txt
+
+    {
+        dig A "$DOMAIN" +short
+        dig AAAA "$DOMAIN" +short
+        dig MX "$DOMAIN" +short
+        dig NS "$DOMAIN" +short
+        dig TXT "$DOMAIN" +short
+    } > osint/dns.txt
+
+    timeout 20s openssl s_client -connect "$DOMAIN:443" -servername "$DOMAIN" \
+        </dev/null 2>/dev/null | openssl x509 -noout -text > osint/cert.txt || true
+
+    if $HAS_AMASS; then
+        timeout 3m amass enum -passive -d "$DOMAIN" > osint/subdomains.txt || true
+    elif $HAS_SUBFINDER; then
+        subfinder -silent -d "$DOMAIN" > osint/subdomains.txt
+    fi
+fi
+
+# ========== Fast Port Scan ==========
+echo -e "${Purple}[*] Fast port scan on $IP...${White}"
+timeout 5m nmap -p- --min-rate 5000 -T4 "$IP" -oN nmap/ports.txt
+
+PORTS=$(grep -oP '\d+(?=/tcp)' nmap/ports.txt | tr '\n' ',' | sed 's/,$//')
+
+[[ -z "$PORTS" ]] && {
+    echo -e "${Red}[!] No open TCP ports found${White}"
+    exit 0
+}
+
+# ========== Service Enumeration ==========
+echo -e "${Purple}[*] Service enumeration...${White}"
+timeout 5m nmap -sC -sV -p "$PORTS" "$IP" -oN nmap/services.txt || true
+
+# ========== Auto Web Service Detection ==========
+echo -e "${Blue}[*] Detecting web services on all ports...${White}"
+
+WEB_TARGETS=()
+
+while read -r line; do
+    port=$(echo "$line" | awk -F/ '{print $1}')
+    service=$(echo "$line" | awk '{print $3}')
+
+    case "$service" in
+        http|http-alt|http-proxy)
+            WEB_TARGETS+=("http://$IP:$port")
+            ;;
+        https|ssl/http|ssl/https)
+            WEB_TARGETS+=("https://$IP:$port")
+            ;;
+    esac
+done < <(grep "open" nmap/services.txt)
+
+# ========== Web Enumeration ==========
+if [[ ${#WEB_TARGETS[@]} -eq 0 ]]; then
+    echo -e "${Purple}[!] No web services detected, skipping web enumeration${White}"
+else
+    for URL in "${WEB_TARGETS[@]}"; do
+        SAFE=$(echo "$URL" | tr '/:' '_')
+        echo -e "${Green}[*] Enumerating web service: $URL${White}"
+
+        whatweb "$URL" -v > "web/whatweb_$SAFE.txt" || true
+
+        timeout 2m nikto -h "$URL" \
+          -output "web/nikto_$SAFE.txt" \
+          || true
+
+        timeout 5m gobuster dir \
+          -u "$URL" \
+          -w /usr/share/wordlists/dirb/common.txt \
+          -x php,html,txt,bak \
+          -t 100 \
+          -o "web/gobuster_$SAFE.txt" \
+          || true
+    done
+fi
+
+# ========== Enumeration Scripts ==========
+echo -e "${Purple}[*] NSE enumeration...${White}"
+timeout 10m nmap --script vuln -p "$PORTS" "$IP" -oN nmap/vuln.txt || true
+
+# ========== SMB / SNMP ==========
+if grep -q "445/tcp open" nmap/services.txt && $HAS_ENUM4LINUX; then
+    echo -e "${Blue}[*] SMB enumeration...${White}"
+    enum4linux -a "$IP" > network/enum4linux.txt
+fi
+
+if grep -q "161/udp open" nmap/services.txt && $HAS_SNMP; then
+    echo -e "${Blue}[*] SNMP enumeration...${White}"
+    timeout 30s snmpwalk -v2c -c public "$IP" > network/snmp.txt || true
+fi
+
+# ========== Finish ==========
+echo -e "${Green}
+[✓] Recon completed successfully
+[✓] Logs: recon.log
+[✓] Project: $PROJECT
+${White}"
