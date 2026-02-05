@@ -24,10 +24,10 @@ Optional (auto-detected)
 	•	theHarvester
 
 How to use:
-nano recon.sh      # paste script
-chmod +x recon.sh
-./recon.sh
-Enter:
+1)nano recon.sh #paste script and save
+2)chmod +x recon.sh (making the script executable)
+3)./recon.sh
+4)Enter:
 	•	Project name
 	•	Target (IP or domain)
 
